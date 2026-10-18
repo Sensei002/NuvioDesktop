@@ -46,14 +46,15 @@ internal typealias NativePlayerCreate = (
     String,
     Int,
     Boolean,
+    Boolean,
     NativePlayerEventSink,
 ) -> Long
 
 internal class NativePlayerController(
     private val host: NativePlayerHost,
-    private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink ->
+    private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, useWebViewControls, sink ->
         NativePlayerBridge.ensureLoaded()
-        NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink)
+        NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, useWebViewControls, sink)
     },
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
     private val nativeSeekTo: (Long, Long) -> Unit = NativePlayerBridge::seekTo,
@@ -303,6 +304,7 @@ internal class NativePlayerController(
         // Create off the EDT and come back to it for the parts that touch Swing state.
         val createWorker = Thread({
             try {
+                val useWebViewControls = NativePlayerBridge.useWebViewControls
                 runCatching {
                     nativeCreate(
                         hostViewPtr,
@@ -310,9 +312,10 @@ internal class NativePlayerController(
                         pending.headerLines.toTypedArray(),
                         pending.playWhenReady,
                         pending.initialPositionMs,
-                        NativePlayerBridge.controlsPageUrl,
+                        if (useWebViewControls) NativePlayerBridge.controlsPageUrl else "",
                         pending.decoderPriority,
                         pending.nvidiaRtxSuperResolutionEnabled,
+                        useWebViewControls,
                         eventSink,
                     ).also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
@@ -440,6 +443,12 @@ internal class NativePlayerController(
         )
         currentVolumeLevel = stateWithVolume.volumeLevel ?: currentVolumeLevel
         controlsState = stateWithVolume
+        if (!NativePlayerBridge.useWebViewControls) {
+            // Native controls mode: mpv renders its own OSC inside the video window, so there
+            // is no HTML page to synchronise. Cursor hiding still comes from the host above.
+            lastSentControlsStructureKey = null
+            return
+        }
         val isFullscreen = isDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
         val structureKey = NativeControlsStructureKey(
             state = stateWithVolume.nativeControlsStructureKey(),

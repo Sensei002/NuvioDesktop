@@ -880,6 +880,7 @@ public:
         JavaVM *vm,
         int decoderPriority,
         bool nvidiaRtxSuperResolutionEnabled,
+        bool useWebViewControls,
         jobject sink,
         jmethodID method
     ) {
@@ -895,8 +896,8 @@ public:
         auto initState = std::make_shared<InitializationState>();
         auto self = shared_from_this();
         uiThread = std::thread(
-            [self, sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, initState]() {
-                self->runNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, initState);
+            [self, sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, useWebViewControls, initState]() {
+                self->runNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, useWebViewControls, initState);
             }
         );
 
@@ -1007,6 +1008,8 @@ public:
 
     void updateControlsJson(const std::string &controlsJson) {
         if (controlsJson.empty()) return;
+        // No HTML overlay: mpv owns the control surface, nothing to push into a page.
+        if (!webViewControlsEnabled) return;
         {
             std::lock_guard<std::mutex> lock(controlsMutex);
             pendingControlsJson = controlsJson;
@@ -1369,6 +1372,12 @@ private:
     bool didOleInitialize = false;
     std::thread uiThread;
 
+    // False when the caller asked for playback without the WebView2 control overlay (the
+    // Evergreen runtime is missing, or native controls were forced). Video is unaffected:
+    // libmpv renders straight into containerHwnd. The controls then come from mpv's own
+    // on-screen controller instead of the HTML page.
+    bool webViewControlsEnabled = true;
+
     ComPtr<ICoreWebView2Environment> environment;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> webView;
@@ -1417,11 +1426,12 @@ private:
         std::string controlsUrl,
         int decoderPriority,
         bool nvidiaRtxSuperResolutionEnabled,
+        bool useWebViewControls,
         std::shared_ptr<InitializationState> initState
     ) {
         std::string failure;
         try {
-            initializeOnNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled);
+            initializeOnNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, useWebViewControls);
         } catch (const std::exception &error) {
             failure = error.what();
             cleanupUiResources();
@@ -1452,7 +1462,8 @@ private:
         long long initialPositionMs,
         const std::string &controlsUrl,
         int decoderPriority,
-        bool nvidiaRtxSuperResolutionEnabled
+        bool nvidiaRtxSuperResolutionEnabled,
+        bool useWebViewControls
     ) {
         registerWindowClasses();
         uiThreadId = GetCurrentThreadId();
@@ -1503,7 +1514,11 @@ private:
             throw std::runtime_error("Unable to create native player container window.");
         }
 
-        startWebView(controlsUrl);
+        webViewControlsEnabled = useWebViewControls;
+
+        if (webViewControlsEnabled) {
+            startWebView(controlsUrl);
+        }
         startMpv(sourceUrl, headerLines, playWhenReady, initialPositionMs, decoderPriority, nvidiaRtxSuperResolutionEnabled);
         layoutNativeSubviews();
         if (!SetTimer(messageHwnd, NUVIO_TIMER_ID, 500, nullptr)) {
@@ -1712,9 +1727,19 @@ private:
             initialStartSeconds = initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0;
 
             setMpvOptionStringLocked("config", "no");
-            setMpvOptionStringLocked("osc", "no");
+            // With the HTML overlay the app draws its own controls, so mpv's OSC stays off.
+            // Without it, mpv's built-in on-screen controller is the only control surface
+            // left, so enable it and let the video window take keyboard input.
+            setMpvOptionStringLocked("osc", webViewControlsEnabled ? "no" : "yes");
             setMpvOptionStringLocked("input-default-bindings", "yes");
-            setMpvOptionStringLocked("input-vo-keyboard", "no");
+            setMpvOptionStringLocked("input-vo-keyboard", webViewControlsEnabled ? "no" : "yes");
+            if (!webViewControlsEnabled) {
+                setMpvOptionStringLocked("osd-level", "1");
+                setMpvOptionStringLocked("osd-bar", "yes");
+                setMpvOptionStringLocked("cursor-autohide", "1000");
+                setMpvOptionStringLocked("osc-valign", "0.92");
+                setMpvOptionStringLocked("osc-hidetimeout", "1200");
+            }
             setMpvOptionStringLocked("keep-open", "yes");
             setMpvOptionStringLocked("volume-max", "200");
             setMpvOptionStringLocked("vo", "gpu-next,gpu,");
@@ -2383,6 +2408,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     jstring controlsPageUrl,
     jint decoderPriority,
     jboolean nvidiaRtxSuperResolutionEnabled,
+    jboolean useWebViewControls,
     jobject eventSink
 ) {
     HWND hostHwnd = (HWND)(intptr_t)hostViewPtr;
@@ -2418,6 +2444,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
             javaVm,
             decoderPriority,
             nvidiaRtxSuperResolutionEnabled == JNI_TRUE,
+            useWebViewControls == JNI_TRUE,
             eventSinkRef,
             eventMethod
         );
@@ -2430,6 +2457,19 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     auto *holder = new std::shared_ptr<WindowsMpvWebPlayer>(player);
     jlong handle = (jlong)(intptr_t)holder;
     return handle;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_isWebView2Available(JNIEnv *, jobject) {
+    // Authoritative probe for the Evergreen WebView2 runtime. Returns S_OK with a version
+    // string when installed, and a failure HRESULT when the machine has no runtime at all.
+    LPWSTR versionInfo = nullptr;
+    HRESULT result = GetAvailableCoreWebView2BrowserVersionString(nullptr, &versionInfo);
+    bool available = SUCCEEDED(result) && versionInfo != nullptr;
+    if (versionInfo) {
+        CoTaskMemFree(versionInfo);
+    }
+    return available ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

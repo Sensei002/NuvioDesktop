@@ -58,6 +58,7 @@ internal object NativePlayerBridge {
         controlsPageUrl: String,
         decoderPriority: Int,
         nvidiaRtxSuperResolutionEnabled: Boolean,
+        useWebViewControls: Boolean,
         eventSink: NativePlayerEventSink,
     ): Long
 
@@ -131,6 +132,41 @@ internal object NativePlayerBridge {
     external fun shutdownWebView2Warmup()
     external fun setWindowsDisplaySleepInhibited(inhibited: Boolean): Boolean
 
+    /**
+     * Windows only: probes the Evergreen WebView2 runtime.
+     *
+     * Playback itself never needs a browser engine - libmpv decodes and renders straight into
+     * a child HWND. WebView2 is only the surface for the HTML control overlay. When the
+     * runtime is missing we therefore fall back to mpv's own on-screen controller instead of
+     * failing to start, so Nuvio plays video on a machine with no WebView2 installed.
+     */
+    private external fun isWebView2Available(): Boolean
+
+    /**
+     * True when the player should create the WebView2 control overlay.
+     *
+     * False on Windows when the runtime is not installed, or when native controls are forced
+     * with `-Dnuvio.player.nativeControls=true` / `NUVIO_PLAYER_NATIVE_CONTROLS=true`.
+     */
+    val useWebViewControls: Boolean by lazy {
+        if (DesktopHostOs.current != DesktopHostOs.WINDOWS) {
+            true
+        } else {
+            !nativeControlsForced && webView2RuntimeAvailable
+        }
+    }
+
+    private val nativeControlsForced: Boolean by lazy {
+        System.getProperty("nuvio.player.nativeControls")?.toBoolean() == true ||
+            System.getenv("NUVIO_PLAYER_NATIVE_CONTROLS")?.toBoolean() == true
+    }
+
+    private val webView2RuntimeAvailable: Boolean by lazy {
+        runCatching { isWebView2Available() }
+            .onFailure { error -> log.w(error) { "WebView2 runtime probe failed; using native controls" } }
+            .getOrDefault(false)
+    }
+
     val controlsPageUrl: String by lazy {
         ensureLoaded()
         controlsPageAssets.url
@@ -140,6 +176,8 @@ internal object NativePlayerBridge {
     fun preloadAsync() {
         if (!preloadStarted.compareAndSet(false, true)) return
         Thread {
+            // Nothing to warm up when the player runs on mpv's own controls.
+            if (!useWebViewControls) return@Thread
             val controlsPage = runCatching { controlsPageAssets }
                 .getOrNull()
                 ?: return@Thread
